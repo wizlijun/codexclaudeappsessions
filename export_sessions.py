@@ -861,6 +861,30 @@ def run_tasks(out_root: str, manifest: dict, tasks, seen: set,
         counters["rendered" if not prev else "updated"] += 1
 
 
+def vendor_source_present(vendor: str, export_dir: str | None = None,
+                          chatgpt_export: str | None = None) -> bool:
+    """Whether the vendor's source exists on this machine.
+
+    Used to gate pruning: a source that is *entirely absent* (the tool runs on a
+    machine that never had that vendor) must NOT prune previously-exported
+    sessions — they may have been produced on another machine and synced into a
+    shared output vault. This only guards total absence; a source dir that exists
+    but is empty still prunes normally (its sessions really were deleted).
+    """
+    if vendor == "claude":
+        return (os.path.isdir(COWORK_BASE) or os.path.isdir(CLAUDE_CODE_BASE)
+                or bool(export_dir and os.path.isfile(
+                    os.path.join(export_dir, "conversations.json"))))
+    if vendor == "openai":
+        return (os.path.isdir(CODEX_SESSIONS)
+                or bool(chatgpt_export and os.path.isfile(chatgpt_export)))
+    if vendor == "droid":
+        return os.path.isdir(DROID_SESSIONS)
+    if vendor == "openclaw":
+        return os.path.isdir(OPENCLAW_AGENTS)
+    return True
+
+
 def prune_manifest(out_root: str, manifest: dict, seen: set,
                    vendors: set) -> int:
     """Drop manifest entries (and their files) whose source vanished."""
@@ -1048,7 +1072,12 @@ def main() -> int:
     # makes the scan partial), so a per-vendor run only ever prunes its own vendor.
     removed = 0
     if args.project is None:
-        removed = prune_manifest(output, manifest, seen, processed_vendors)
+        prunable = {v for v in processed_vendors
+                    if vendor_source_present(v, export_dir, chatgpt_export)}
+        for v in sorted(processed_vendors - prunable):
+            print(f"  (prune) {v} source absent on this machine; "
+                  f"keeping existing sessions", file=sys.stderr)
+        removed = prune_manifest(output, manifest, seen, prunable)
 
     # Rebuild index + per-project metas from the full manifest (incremental-safe).
     rows = manifest_rows(output, manifest)
