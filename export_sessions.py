@@ -8,8 +8,8 @@ Output layout:
       openai/<account>/{chatgpt,codex}/*.md
       droid/<account>/*.md
       openclaw/<account>/{webchat,weixin,wecom,cron,subagent,...}/*.md
-      index.md                 (landing: totals + links to month files)
-      index-YYYY-MM.md         (one concise line per session that month)
+      index-<device>.md        (per-device landing: totals + month links)
+      index-<device>-YYYY-MM.md (one concise line per session that month)
 
 Sources and where they live:
   * claude/chat        - Claude app export (conversations.json + users.json)
@@ -809,6 +809,11 @@ def device_id() -> str:
     return val
 
 
+def device_slug() -> str:
+    """Filesystem-safe form of device_id(), used in index-<device>-*.md names."""
+    return re.sub(r"[^\w.\-]", "_", device_id()) or "device"
+
+
 def _mtime(path: str) -> float:
     try:
         return os.path.getmtime(path)
@@ -973,9 +978,8 @@ def _render_rows(lines: list[dict], rows: list[dict], link_prefix: str) -> None:
         if r.get("project_path"):
             proj = f"[{proj}]({link_prefix}{r['project_path']})"
         acct = r["account"] or "unknown"
-        device = r.get("device") or device_id()
         lines.append(
-            f"- {date_str} · {device} · {r['vendor']}/{acct} · {r['source']} · "
+            f"- {date_str} · {r['vendor']}/{acct} · {r['source']} · "
             f"{proj} · {r['turns']}t · [{title}]({link_prefix}{r['path']})")
 
 
@@ -987,49 +991,62 @@ def _vendor_counts(rows: list[dict]) -> str:
 
 
 def write_index(out_root: str, rows: list[dict]) -> None:
-    """Write one concise month file per month (index-YYYY-MM.md) plus a small
-    landing index.md linking to them. No tables: each session is a single
-    self-contained line so an agent can read/grep it directly. Stale month files
-    are pruned; the legacy index/ shard directory is removed."""
+    """Write this device's index files: one concise month file per month
+    (index-<device>-YYYY-MM.md) plus a per-device landing (index-<device>.md)
+    linking to them. Every file is device-scoped so devices sharing one vault
+    never overwrite each other's index. No tables: each session is a single
+    self-contained line so an agent can read/grep it directly. Only this
+    device's stale files are pruned; legacy shared index files are removed."""
+    dev = device_slug()
     months: dict[str, list[dict]] = {}
     for r in rows:
         months.setdefault(_month_key(r["when"]), []).append(r)
+
+    landing = f"index-{dev}.md"
 
     # One flat, line-per-session file per month, at the output root.
     written: set = set()
     for key in sorted(months, reverse=True):
         mrows = months[key]
-        lines = [f"# Sessions — {key}", "",
+        lines = [f"# Sessions — {dev} — {key}", "",
                  f"{len(mrows)} sessions · {_vendor_counts(mrows)}", "",
-                 "[← index](index.md)", ""]
+                 f"[← index]({landing})", ""]
         _render_rows(lines, mrows, "")
-        name = f"index-{key}.md"
+        name = f"index-{dev}-{key}.md"
         with open(os.path.join(out_root, name), "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines).rstrip() + "\n")
         written.add(name)
 
-    # Prune month files for months that no longer have any sessions.
-    for stale in glob.glob(os.path.join(out_root, "index-*.md")):
+    # Prune only *this device's* month files for months that no longer exist.
+    for stale in glob.glob(os.path.join(out_root, f"index-{dev}-*.md")):
         if os.path.basename(stale) not in written:
             os.remove(stale)
-    # Remove the legacy index/ shard directory if it lingers from older runs.
-    legacy = os.path.join(out_root, "index")
-    if os.path.isdir(legacy):
-        shutil.rmtree(legacy, ignore_errors=True)
+    # Remove legacy shared index files from before the per-device split, and the
+    # old index/ shard directory. These are never re-created, so this is a
+    # one-time cleanup; other devices' index-<device>*.md files are untouched.
+    for legacy in [os.path.join(out_root, "index.md"),
+                   os.path.join(out_root, "index")]:
+        if os.path.isdir(legacy):
+            shutil.rmtree(legacy, ignore_errors=True)
+        elif os.path.isfile(legacy):
+            os.remove(legacy)
+    for legacy in glob.glob(os.path.join(out_root, "index-*.md")):
+        if re.match(r"index-(\d{4}-\d{2}|undated)\.md$", os.path.basename(legacy)):
+            os.remove(legacy)
 
-    # Landing page: totals + a concise month directory (a list, not a table).
+    # Per-device landing: totals + a concise month directory (a list, not a table).
     vendors: dict[str, list[dict]] = {}
     for r in rows:
         vendors.setdefault(r["vendor"], []).append(r)
-    lines = ["# Sessions Index", "",
+    lines = [f"# Sessions Index — {dev}", "",
              f"Total: {len(rows)} · "
              + ", ".join(f"{v} {len(rs)}" for v, rs in sorted(vendors.items())),
              "", "## Months", ""]
     for key in sorted(months, reverse=True):
         mrows = months[key]
-        lines.append(f"- [{key}](index-{key}.md) — {len(mrows)} · {_vendor_counts(mrows)}")
+        lines.append(f"- [{key}](index-{dev}-{key}.md) — {len(mrows)} · {_vendor_counts(mrows)}")
 
-    with open(os.path.join(out_root, "index.md"), "w", encoding="utf-8") as fh:
+    with open(os.path.join(out_root, landing), "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines).rstrip() + "\n")
 
 
@@ -1120,7 +1137,8 @@ def main() -> int:
     for r in rows:
         summary[r["vendor"]] = summary.get(r["vendor"], 0) + 1
     line = ", ".join(f"{v}: {n}" for v, n in sorted(summary.items())) or "nothing"
-    print(f"\nDone. {len(rows)} session file(s) + index.md in '{output}/'\n  {line}")
+    print(f"\nDone. {len(rows)} session file(s) + index-{device_slug()}.md "
+          f"in '{output}/'\n  {line}")
     return 0
 
 
