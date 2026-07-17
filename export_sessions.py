@@ -7,6 +7,7 @@ Output layout:
       claude/<account>/{chat,cowork,claude-code}/*.md
       openai/<account>/{chatgpt,codex}/*.md
       droid/<account>/*.md
+      openclaw/<account>/{webchat,weixin,wecom,cron,subagent,...}/*.md
       index.md
 
 Sources and where they live:
@@ -17,14 +18,17 @@ Sources and where they live:
   * openai/chatgpt     - a ChatGPT data export conversations.json (chats are
                          server-side; pass one with --chatgpt-export)
   * droid              - ~/.factory/sessions/<proj>/<uuid>.jsonl
+  * openclaw           - ~/.openclaw/agents/<agent>/sessions/<uuid>.jsonl
 
 Account attribution: chat from users.json; cowork per-session from its metadata;
 claude-code/codex from the current CLI login (no per-session account is
-recorded); droid from the session owner.
+recorded); droid from the session owner; openclaw from authProfileOverride
+(or agent id).
 
 Usage:
     python export_sessions.py                          # everything found
     python export_sessions.py --vendor openai           # just OpenAI
+    python export_sessions.py --vendor openclaw
     python export_sessions.py --vendor droid --project hemory
     python export_sessions.py --chatgpt-export ~/Downloads/conversations.json
     python export_sessions.py --thinking                # include reasoning
@@ -46,6 +50,7 @@ from chatgpt_md import conversation_to_md as chatgpt_conv_to_md
 from chatgpt_md import load_conversations as load_chatgpt
 from codex_md import codex_to_md
 from droid_md import droid_to_md
+from openclaw_md import openclaw_to_md
 from transcript_md import transcript_to_md
 
 HOME = os.path.expanduser("~")
@@ -56,6 +61,8 @@ CLAUDE_CONFIG = os.path.join(HOME, ".claude.json")
 CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
 CODEX_AUTH = os.path.join(HOME, ".codex", "auth.json")
 DROID_SESSIONS = os.path.join(HOME, ".factory", "sessions")
+OPENCLAW_AGENTS = os.path.join(HOME, ".openclaw", "agents")
+OPENCLAW_CONFIG = os.path.join(HOME, ".openclaw", "openclaw.json")
 
 # Config file lives next to this script.
 DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yml")
@@ -128,10 +135,11 @@ def emit(out_root: str, vendor: str, account: str, source: str | None,
          git: dict | None = None, force_path: str | None = None) -> dict:
     """Write one session file and return its index row.
 
-    High-volume agent sources (codex, droid, claude-code) pass `project` to bucket
-    sessions into per-project subfolders, plus `cwd`/`git` so a per-project
-    _project.md can describe the repository. `force_path` (relative to out_root)
-    overwrites an existing session's file in place during incremental re-export.
+    High-volume agent sources (codex, droid, claude-code, openclaw) pass `project`
+    to bucket sessions into per-project subfolders, plus `cwd`/`git` so a
+    per-project _project.md can describe the repository. `force_path` (relative
+    to out_root) overwrites an existing session's file in place during
+    incremental re-export.
     """
     acct = account_slug(account)
     rel_parts = [vendor, acct] + ([source] if source else [])
@@ -582,6 +590,183 @@ def droid_tasks(thinking: bool, project: str | None):
 
 
 # --------------------------------------------------------------------------- #
+# OpenClaw
+# --------------------------------------------------------------------------- #
+def _openclaw_account_slug(profile: str | None, agent: str) -> str:
+    """Normalize authProfileOverride (e.g. openai:user@x.com) to a short label."""
+    if not profile:
+        return agent or "openclaw"
+    # "openai:projecthemory@gmail.com" / "openai-codex:foo@bar.com" → email
+    if ":" in profile and "@" in profile:
+        return profile.split(":", 1)[1]
+    return profile
+
+
+def _openclaw_source_from_key(session_key: str | None) -> str:
+    """Map sessions.json key like agent:main:cron:… / openclaw-weixin:… → source."""
+    if not session_key:
+        return "session"
+    parts = session_key.split(":")
+    # agent:<id>:<channel>[:…]
+    if len(parts) >= 3 and parts[0] == "agent":
+        channel = parts[2]
+        if channel == "openclaw-weixin":
+            return "weixin"
+        if channel in ("main", "explicit"):
+            return "webchat"
+        if channel in ("cron", "subagent", "dashboard", "wecom", "webchat"):
+            return channel
+        return channel
+    return "session"
+
+
+def _load_openclaw_index(agent_dir: str) -> dict[str, dict]:
+    """sessionId → index entry from sessions.json (best-effort)."""
+    path = os.path.join(agent_dir, "sessions", "sessions.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    by_id: dict[str, dict] = {}
+    if not isinstance(data, dict):
+        return by_id
+    for key, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        sid = entry.get("sessionId")
+        if not sid:
+            continue
+        # Prefer the richest / latest entry when multiple keys share a sessionId.
+        prev = by_id.get(sid)
+        if prev is None or (entry.get("updatedAt") or 0) >= (prev.get("updatedAt") or 0):
+            enriched = dict(entry)
+            enriched["_sessionKey"] = key
+            by_id[sid] = enriched
+    # Also index by sessionFile basename for files not currently in the live map
+    # (historical sessions whose index slot was rotated away).
+    return by_id
+
+
+def _openclaw_index_by_file(agent_dir: str) -> dict[str, dict]:
+    """Absolute sessionFile path → index entry."""
+    path = os.path.join(agent_dir, "sessions", "sessions.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    by_file: dict[str, dict] = {}
+    if not isinstance(data, dict):
+        return by_file
+    for key, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        sf = entry.get("sessionFile")
+        if not sf:
+            continue
+        enriched = dict(entry)
+        enriched["_sessionKey"] = key
+        by_file[os.path.abspath(sf)] = enriched
+    return by_file
+
+
+def openclaw_tasks(thinking: bool, project: str | None):
+    if not os.path.isdir(OPENCLAW_AGENTS):
+        print("  (openclaw) none found; skipping", file=sys.stderr)
+        return
+    for agent_dir in sorted(glob.glob(os.path.join(OPENCLAW_AGENTS, "*"))):
+        if not os.path.isdir(agent_dir):
+            continue
+        agent = os.path.basename(agent_dir)
+        if agent.startswith("."):
+            continue
+        sessions_dir = os.path.join(agent_dir, "sessions")
+        if not os.path.isdir(sessions_dir):
+            continue
+        by_file = _openclaw_index_by_file(agent_dir)
+        by_id = _load_openclaw_index(agent_dir)
+
+        for jsonl in sorted(glob.glob(os.path.join(sessions_dir, "*.jsonl"))):
+            base = os.path.basename(jsonl)
+            # Skip trajectory traces, checkpoints, resets, and other non-session logs.
+            # Primary sessions are plain <uuid>.jsonl only.
+            if (base.endswith(".trajectory.jsonl")
+                    or ".checkpoint." in base
+                    or ".reset." in base
+                    or base.endswith(".bak")
+                    or ".migrated" in base
+                    or ".pre-doctor" in base
+                    or base.count(".") != 1):
+                continue
+            key = jsonl
+            version = _mtime(jsonl)
+
+            def render(jsonl=jsonl, agent=agent, by_file=by_file, by_id=by_id):
+                sid = os.path.splitext(os.path.basename(jsonl))[0]
+                meta = by_file.get(os.path.abspath(jsonl)) or by_id.get(sid) or {}
+                session_key = meta.get("_sessionKey")
+                source = _openclaw_source_from_key(session_key)
+                account = _openclaw_account_slug(
+                    meta.get("authProfileOverride"), agent)
+                label = (meta.get("label") or "").strip() or None
+                origin = meta.get("origin") or {}
+                surface = origin.get("surface") or origin.get("provider")
+                model = meta.get("model")
+                cwd_hint = None
+                # systemPromptReport carries workspaceDir when present.
+                spr = meta.get("systemPromptReport") or {}
+                if isinstance(spr, dict):
+                    cwd_hint = spr.get("workspaceDir")
+
+                result = openclaw_to_md(
+                    jsonl,
+                    meta_extra={"Source": f"OpenClaw ({source})",
+                                "Agent": agent},
+                    include_thinking=thinking,
+                    title=label,
+                )
+                if result["user_turns"] == 0:
+                    return None
+                cwd = result.get("cwd") or cwd_hint
+                proj = os.path.basename(cwd) if cwd else None
+                if project and project.lower() not in (
+                        (cwd or "") + " " + (label or "") + " " + agent).lower():
+                    return None
+
+                extra = {
+                    "Source": f"OpenClaw ({source})",
+                    "Agent": agent,
+                    "Project": proj,
+                    "Working dir": cwd,
+                    "Channel": surface,
+                    "Session": sid,
+                }
+                # Prefer index model when the transcript itself has none.
+                if model and not result.get("model"):
+                    extra["Model"] = model
+                result = openclaw_to_md(
+                    jsonl, meta_extra=extra, include_thinking=thinking,
+                    title=label or result["title"],
+                )
+                when = result["started"]
+                if not when and meta.get("sessionStartedAt"):
+                    when = rc.epoch_to_dt(meta["sessionStartedAt"])
+                return {
+                    "account": account,
+                    "source": source,
+                    "project": proj,
+                    "when": when,
+                    "title": result["title"],
+                    "markdown": result["markdown"],
+                    "turns": result["user_turns"],
+                    "cwd": cwd,
+                    "git": None,
+                }
+            yield key, version, "openclaw", render
+
+
+# --------------------------------------------------------------------------- #
 # Incremental export (manifest-driven)
 # --------------------------------------------------------------------------- #
 MANIFEST_NAME = ".export_manifest.json"
@@ -745,7 +930,7 @@ def write_index(out_root: str, rows: list[dict]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--vendor", choices=["all", "claude", "openai", "droid"],
+    parser.add_argument("--vendor", choices=["all", "claude", "openai", "droid", "openclaw"],
                         default="all", help="Which vendor to export (default: all)")
     parser.add_argument("-o", "--output", default=None,
                         help="Output directory (overrides config.yml output_dir)")
@@ -798,6 +983,10 @@ def main() -> int:
         print("Exporting droid…")
         processed_vendors.add("droid")
         run_tasks(output, manifest, droid_tasks(thinking, args.project), seen, counters)
+    if args.vendor in ("all", "openclaw"):
+        print("Exporting openclaw…")
+        processed_vendors.add("openclaw")
+        run_tasks(output, manifest, openclaw_tasks(thinking, args.project), seen, counters)
 
     # Prune sessions whose source disappeared. Pruning is scoped to the vendors
     # processed this run, and skipped entirely under a --project filter (which
