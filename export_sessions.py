@@ -702,16 +702,21 @@ def manifest_rows(out_root: str, manifest: dict) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # Index + main
 # --------------------------------------------------------------------------- #
-def write_index(out_root: str, rows: list[dict]) -> None:
-    earliest = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
-    lines = ["# Sessions Index", "", f"Total sessions: **{len(rows)}**", ""]
+def _month_key(when) -> str:
+    """Bucket key for a session row: 'YYYY-MM', or 'undated' when no timestamp."""
+    return when.strftime("%Y-%m") if when else "undated"
 
+
+def _render_rows(lines: list[dict], rows: list[dict], link_prefix: str) -> None:
+    """Append the vendor -> account -> session-table view for `rows`.
+
+    `link_prefix` is prepended to every session/project link so the tables render
+    correctly from wherever the file lives (e.g. '../' for shards under index/).
+    """
+    earliest = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
     vendors: dict[str, list[dict]] = {}
     for r in rows:
         vendors.setdefault(r["vendor"], []).append(r)
-
-    lines.append("Vendors: " + ", ".join(f"{v} ({len(rs)})" for v, rs in sorted(vendors.items())))
-    lines.append("")
 
     for vendor in sorted(vendors):
         lines.append(f"# {vendor}")
@@ -734,9 +739,59 @@ def write_index(out_root: str, rows: list[dict]) -> None:
                 title = r["title"].replace("|", "\\|")
                 proj = (r.get("project") or "—").replace("|", "\\|")
                 if r.get("project_path"):
-                    proj = f"[{proj}]({r['project_path']})"
-                lines.append(f"| {date_str} | {r['source']} | {proj} | [{title}]({r['path']}) | {r['turns']} |")
+                    proj = f"[{proj}]({link_prefix}{r['project_path']})"
+                lines.append(f"| {date_str} | {r['source']} | {proj} | "
+                             f"[{title}]({link_prefix}{r['path']}) | {r['turns']} |")
             lines.append("")
+
+
+def _vendor_counts(rows: list[dict]) -> str:
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r["vendor"]] = counts.get(r["vendor"], 0) + 1
+    return ", ".join(f"{v} {n}" for v, n in sorted(counts.items()))
+
+
+def write_index(out_root: str, rows: list[dict]) -> None:
+    """Write a small landing index.md (counts + monthly links) plus one detail
+    shard per month under index/YYYY-MM.md. Bounds each file's size and keeps git
+    diffs localized to the current month; stale shards are pruned."""
+    index_dir = os.path.join(out_root, "index")
+    os.makedirs(index_dir, exist_ok=True)
+
+    months: dict[str, list[dict]] = {}
+    for r in rows:
+        months.setdefault(_month_key(r["when"]), []).append(r)
+
+    # One detail shard per month (newest first). Links are prefixed '../' since
+    # shards live one level below the session files' root.
+    written: set = set()
+    for key in sorted(months, reverse=True):
+        mrows = months[key]
+        lines = [f"# Sessions — {key}", "",
+                 f"Total: **{len(mrows)}**  ·  {_vendor_counts(mrows)}", "",
+                 "[← index](../index.md)", ""]
+        _render_rows(lines, mrows, "../")
+        with open(os.path.join(index_dir, f"{key}.md"), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines).rstrip() + "\n")
+        written.add(f"{key}.md")
+
+    # Prune shards for months that no longer have any sessions.
+    for stale in glob.glob(os.path.join(index_dir, "*.md")):
+        if os.path.basename(stale) not in written:
+            os.remove(stale)
+
+    # Landing page: totals + a month directory linking into the shards.
+    vendors: dict[str, list[dict]] = {}
+    for r in rows:
+        vendors.setdefault(r["vendor"], []).append(r)
+    lines = ["# Sessions Index", "", f"Total sessions: **{len(rows)}**", "",
+             "Vendors: " + ", ".join(f"{v} ({len(rs)})" for v, rs in sorted(vendors.items())),
+             "", "## By month", "",
+             "| Month | Sessions | Breakdown |", "| --- | --- | --- |"]
+    for key in sorted(months, reverse=True):
+        mrows = months[key]
+        lines.append(f"| [{key}](index/{key}.md) | {len(mrows)} | {_vendor_counts(mrows)} |")
 
     with open(os.path.join(out_root, "index.md"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines).rstrip() + "\n")
