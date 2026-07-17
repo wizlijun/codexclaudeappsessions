@@ -46,9 +46,10 @@ committed. This dictates two rules:
 
 - The **per-device manifest files must be committed** so that after `git pull`,
   device B can read device A's manifest and build the union index.
-- The **device_id file must be git-ignored** so it is never synced. If it were
-  committed, every machine would pull the same id and device-scoping would
-  collapse into a single shared identity — the bug we are fixing.
+- The **device_id must NOT live in the vault at all.** It is per-machine tool
+  state, not exported data, so it belongs next to the tool — in the directory
+  that holds `runapp.sh` / `export_sessions.py` (the tool's install/clone dir),
+  git-ignored in *this* repo so it is never committed and stays device-local.
 
 ## Design
 
@@ -56,22 +57,23 @@ committed. This dictates two rules:
 
 New helpers (in `export_sessions.py`):
 
-- `device_id(out_root) -> str`
-  - Read from `<out_root>/.device_id` (i.e. under `agent-sessions`).
+- `SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))` — same anchor already
+  used for `DEFAULT_CONFIG` (`export_sessions.py:68`); this is the directory that
+  contains `runapp.sh`.
+- `device_id() -> str`
+  - Read from `<SCRIPT_DIR>/.device_id`.
   - If absent: generate `uuid.uuid4()`, write the file, return it. First-run
-    generation only.
-  - **Load-bearing requirement:** `agent-sessions/.device_id` must be added to
-    the sotvault repo's `.gitignore`, so git-based sync keeps it local per
-    machine. Because sync is git (not live file sync), a git-ignored file stays
-    device-local.
+    generation only. No `out_root` argument — the id is independent of which
+    vault is being written.
+  - **Load-bearing requirement:** add `.device_id` to *this* repo's `.gitignore`,
+    so it is never committed. Each machine clones the repo separately and keeps
+    its own stable id.
 - `device_name() -> str`
   - `socket.gethostname()`, falling back to `Device-<device_id()[:8]>` on error
     or empty result.
 
-Caveat: this placement is safe *because* the vault syncs via git + `.gitignore`.
-If the vault were ever moved to a live file-sync mechanism (Dropbox/iCloud),
-`.device_id` would sync and break scoping; such a move would require relocating
-the id file to a non-synced path (e.g. `~/.config/codexclaudeappsessions/`).
+Rationale: the tool's clone directory is inherently per-machine and is never the
+shared synced data vault, so the id file cannot leak between devices.
 
 ### 2. Manifest layout
 
@@ -94,7 +96,7 @@ Each file keeps the existing shape plus two identity fields:
 
 `MANIFEST_NAME` becomes the directory name `.export_manifest`.
 `manifest_path(out_root)` returns
-`<out_root>/.export_manifest/<device_id(out_root)>.json`.
+`<out_root>/.export_manifest/<device_id()>.json`.
 
 ### 3. Read / write responsibilities
 
@@ -160,12 +162,11 @@ save_manifest ──────────> vault/.export_manifest/<id>.json  
 
 - Missing/corrupt device manifest → treated as empty, skipped in the union read
   (never aborts the run).
-- Cannot write `<out_root>/.device_id` → fall back to an in-memory id derived
+- Cannot write `<SCRIPT_DIR>/.device_id` → fall back to an in-memory id derived
   from `device_name()` for this run and warn on stderr (degrades to
   hostname-scoped rather than crashing).
 - `.export_manifest/` directory creation is `exist_ok=True`.
-- Implementation must also add `agent-sessions/.device_id` to the sotvault
-  repo's `.gitignore` (a change in that repo, not this one).
+- Implementation must add `.device_id` to this repo's `.gitignore`.
 
 ## Testing
 
