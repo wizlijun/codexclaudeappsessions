@@ -1,0 +1,22 @@
+# Configuration for the session export tool (export_sessions.py).
+#
+# output_dir: root directory where the exported session Markdown is written.
+#   The tool creates <output_dir>/<vendor>/<account>/... under this path.
+#   A CLI --output/-o flag overrides this value.
+output_dir: /Users/bruce/git/sotvault/agent-sessions
+
+# Optional overrides (uncomment to use):
+#
+# Path to a ChatGPT data-export conversations.json (ChatGPT chats are
+# server-side and cannot be read locally).
+# chatgpt_export: /Users/bruce/Downloads/chatgpt-export/conversations.json
+#
+# Account email to attribute Claude Code / Codex sessions to (they do not record
+# a per-session account). Defaults to the current CLI login.
+# code_account: bruce@runningbruce.com
+#
+# Claude chat export directory (contains conversations.json + users.json).
+# export_dir: data-42e56224-4665-4b94-b4d5-6e7f0a5ff283-1781575676-74446895-batch-0000
+#
+# Include assistant thinking / reasoning blocks (collapsed) in the output.
+# thinking: false
