@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .DS_Store
 runapp.log
+.export_manifest.json
+.device_id

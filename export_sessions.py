@@ -8,7 +8,8 @@ Output layout:
       openai/<account>/{chatgpt,codex}/*.md
       droid/<account>/*.md
       openclaw/<account>/{webchat,weixin,wecom,cron,subagent,...}/*.md
-      index.md
+      index.md                 (landing: totals + links to month files)
+      index-YYYY-MM.md         (one concise line per session that month)
 
 Sources and where they live:
   * claude/chat        - Claude app export (conversations.json + users.json)
@@ -42,8 +43,11 @@ import glob
 import json
 import os
 import re
+import shutil
+import socket
 import subprocess
 import sys
+import uuid
 
 import render_common as rc
 from chatgpt_md import conversation_to_md as chatgpt_conv_to_md
@@ -161,7 +165,7 @@ def emit(out_root: str, vendor: str, account: str, source: str | None,
         "vendor": vendor, "account": account, "source": source or vendor,
         "project": project, "proj_rel": proj_rel,
         "project_path": f"{proj_rel}/_project.md" if project else None,
-        "cwd": cwd, "git": git,
+        "cwd": cwd, "git": git, "device": device_id(),
         "when": when, "title": title, "turns": turns, "path": rel_path,
     }
 
@@ -770,6 +774,39 @@ def openclaw_tasks(thinking: bool, project: str | None):
 # Incremental export (manifest-driven)
 # --------------------------------------------------------------------------- #
 MANIFEST_NAME = ".export_manifest.json"
+DEVICE_ID_NAME = ".device_id"
+_DEVICE_ID: str | None = None
+
+
+def device_id() -> str:
+    """Stable label for this device, so index rows show which machine wrote them.
+
+    Persisted in the run directory (next to the manifest, not synced into the
+    shared vault). First run seeds it from the hostname, falling back to a short
+    random id; the file is plain text and can be hand-edited to rename a device.
+    """
+    global _DEVICE_ID
+    if _DEVICE_ID is not None:
+        return _DEVICE_ID
+    path = os.path.join(os.getcwd(), DEVICE_ID_NAME)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            val = fh.read().strip()
+    except OSError:
+        val = ""
+    if not val:
+        try:
+            val = socket.gethostname().strip()
+        except OSError:
+            val = ""
+        val = val or f"device-{uuid.uuid4().hex[:8]}"
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(val + "\n")
+        except OSError:
+            pass
+    _DEVICE_ID = val
+    return val
 
 
 def _mtime(path: str) -> float:
@@ -779,13 +816,16 @@ def _mtime(path: str) -> float:
         return 0.0
 
 
-def manifest_path(out_root: str) -> str:
-    return os.path.join(out_root, MANIFEST_NAME)
+def manifest_path() -> str:
+    # The manifest lives in the current run directory (where runapp.sh / the
+    # tool is invoked), not in the output vault — it's tool-local state, not
+    # part of the exported, syncable session set.
+    return os.path.join(os.getcwd(), MANIFEST_NAME)
 
 
-def load_manifest(out_root: str) -> dict:
+def load_manifest() -> dict:
     try:
-        with open(manifest_path(out_root), encoding="utf-8") as fh:
+        with open(manifest_path(), encoding="utf-8") as fh:
             data = json.load(fh)
         if isinstance(data, dict) and isinstance(data.get("sessions"), dict):
             return data
@@ -794,8 +834,8 @@ def load_manifest(out_root: str) -> dict:
     return {"version": 1, "sessions": {}}
 
 
-def save_manifest(out_root: str, manifest: dict) -> None:
-    with open(manifest_path(out_root), "w", encoding="utf-8") as fh:
+def save_manifest(manifest: dict) -> None:
+    with open(manifest_path(), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, ensure_ascii=False, indent=0)
 
 
@@ -917,41 +957,26 @@ def _month_key(when) -> str:
 
 
 def _render_rows(lines: list[dict], rows: list[dict], link_prefix: str) -> None:
-    """Append the vendor -> account -> session-table view for `rows`.
+    """Append one concise, self-contained line per session (no tables).
 
-    `link_prefix` is prepended to every session/project link so the tables render
-    correctly from wherever the file lives (e.g. '../' for shards under index/).
+    Each line carries its own context — date, vendor/account, source, project,
+    turns, and a link to the session file — so an agent can grep a single line
+    and understand it. Rows are sorted oldest-first, so new sessions land at the
+    bottom (an append-style log). `link_prefix` is prepended to every link so
+    they resolve from wherever the file lives.
     """
     earliest = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
-    vendors: dict[str, list[dict]] = {}
-    for r in rows:
-        vendors.setdefault(r["vendor"], []).append(r)
-
-    for vendor in sorted(vendors):
-        lines.append(f"# {vendor}")
-        lines.append("")
-        accounts: dict[str, list[dict]] = {}
-        for r in vendors[vendor]:
-            accounts.setdefault(r["account"] or "unknown-account", []).append(r)
-        for acct in sorted(accounts):
-            acct_rows = sorted(accounts[acct], key=lambda r: (r["when"] or earliest))
-            by_source: dict[str, int] = {}
-            for r in acct_rows:
-                by_source[r["source"]] = by_source.get(r["source"], 0) + 1
-            srcsummary = ", ".join(f"{k} {v}" for k, v in sorted(by_source.items()))
-            lines.append(f"## {acct}  ({srcsummary})")
-            lines.append("")
-            lines.extend(["| Date | Source | Project | Session | Turns |",
-                          "| --- | --- | --- | --- | --- |"])
-            for r in acct_rows:
-                date_str = rc.fmt_dt(r["when"]) or "—"
-                title = r["title"].replace("|", "\\|")
-                proj = (r.get("project") or "—").replace("|", "\\|")
-                if r.get("project_path"):
-                    proj = f"[{proj}]({link_prefix}{r['project_path']})"
-                lines.append(f"| {date_str} | {r['source']} | {proj} | "
-                             f"[{title}]({link_prefix}{r['path']}) | {r['turns']} |")
-            lines.append("")
+    for r in sorted(rows, key=lambda r: (r["when"] or earliest)):
+        date_str = rc.fmt_dt(r["when"]) or "—"
+        title = " ".join((r["title"] or "untitled").split()).replace("]", "\\]")
+        proj = r.get("project") or "-"
+        if r.get("project_path"):
+            proj = f"[{proj}]({link_prefix}{r['project_path']})"
+        acct = r["account"] or "unknown"
+        device = r.get("device") or device_id()
+        lines.append(
+            f"- {date_str} · {device} · {r['vendor']}/{acct} · {r['source']} · "
+            f"{proj} · {r['turns']}t · [{title}]({link_prefix}{r['path']})")
 
 
 def _vendor_counts(rows: list[dict]) -> str:
@@ -962,45 +987,47 @@ def _vendor_counts(rows: list[dict]) -> str:
 
 
 def write_index(out_root: str, rows: list[dict]) -> None:
-    """Write a small landing index.md (counts + monthly links) plus one detail
-    shard per month under index/YYYY-MM.md. Bounds each file's size and keeps git
-    diffs localized to the current month; stale shards are pruned."""
-    index_dir = os.path.join(out_root, "index")
-    os.makedirs(index_dir, exist_ok=True)
-
+    """Write one concise month file per month (index-YYYY-MM.md) plus a small
+    landing index.md linking to them. No tables: each session is a single
+    self-contained line so an agent can read/grep it directly. Stale month files
+    are pruned; the legacy index/ shard directory is removed."""
     months: dict[str, list[dict]] = {}
     for r in rows:
         months.setdefault(_month_key(r["when"]), []).append(r)
 
-    # One detail shard per month (newest first). Links are prefixed '../' since
-    # shards live one level below the session files' root.
+    # One flat, line-per-session file per month, at the output root.
     written: set = set()
     for key in sorted(months, reverse=True):
         mrows = months[key]
         lines = [f"# Sessions — {key}", "",
-                 f"Total: **{len(mrows)}**  ·  {_vendor_counts(mrows)}", "",
-                 "[← index](../index.md)", ""]
-        _render_rows(lines, mrows, "../")
-        with open(os.path.join(index_dir, f"{key}.md"), "w", encoding="utf-8") as fh:
+                 f"{len(mrows)} sessions · {_vendor_counts(mrows)}", "",
+                 "[← index](index.md)", ""]
+        _render_rows(lines, mrows, "")
+        name = f"index-{key}.md"
+        with open(os.path.join(out_root, name), "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines).rstrip() + "\n")
-        written.add(f"{key}.md")
+        written.add(name)
 
-    # Prune shards for months that no longer have any sessions.
-    for stale in glob.glob(os.path.join(index_dir, "*.md")):
+    # Prune month files for months that no longer have any sessions.
+    for stale in glob.glob(os.path.join(out_root, "index-*.md")):
         if os.path.basename(stale) not in written:
             os.remove(stale)
+    # Remove the legacy index/ shard directory if it lingers from older runs.
+    legacy = os.path.join(out_root, "index")
+    if os.path.isdir(legacy):
+        shutil.rmtree(legacy, ignore_errors=True)
 
-    # Landing page: totals + a month directory linking into the shards.
+    # Landing page: totals + a concise month directory (a list, not a table).
     vendors: dict[str, list[dict]] = {}
     for r in rows:
         vendors.setdefault(r["vendor"], []).append(r)
-    lines = ["# Sessions Index", "", f"Total sessions: **{len(rows)}**", "",
-             "Vendors: " + ", ".join(f"{v} ({len(rs)})" for v, rs in sorted(vendors.items())),
-             "", "## By month", "",
-             "| Month | Sessions | Breakdown |", "| --- | --- | --- |"]
+    lines = ["# Sessions Index", "",
+             f"Total: {len(rows)} · "
+             + ", ".join(f"{v} {len(rs)}" for v, rs in sorted(vendors.items())),
+             "", "## Months", ""]
     for key in sorted(months, reverse=True):
         mrows = months[key]
-        lines.append(f"| [{key}](index/{key}.md) | {len(mrows)} | {_vendor_counts(mrows)} |")
+        lines.append(f"- [{key}](index-{key}.md) — {len(mrows)} · {_vendor_counts(mrows)}")
 
     with open(os.path.join(out_root, "index.md"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines).rstrip() + "\n")
@@ -1039,9 +1066,9 @@ def main() -> int:
     print(f"Output root: {output}")
     os.makedirs(output, exist_ok=True)
 
-    # Incremental: a manifest in the output root tracks each source's version
+    # Incremental: a manifest in the run directory tracks each source's version
     # (mtime / updated_at) and its index row, so unchanged sessions are skipped.
-    manifest = load_manifest(output)
+    manifest = load_manifest()
     seed_used_from_manifest(output, manifest)
     seen: set = set()
     processed_vendors: set = set()
@@ -1084,7 +1111,7 @@ def main() -> int:
     aggregate_projects(rows)
     n_projects = write_project_metas(output)
     write_index(output, rows)
-    save_manifest(output, manifest)
+    save_manifest(manifest)
 
     print(f"  changed: {counters['rendered']} new, {counters['updated']} updated; "
           f"{counters['unchanged']} unchanged, {removed} removed; "
