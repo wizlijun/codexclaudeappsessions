@@ -38,23 +38,40 @@ algorithm already used in `~/git/mdeditor`.
 
 We port this pattern directly.
 
+## Sync model (why storage locations matter)
+
+The output vault (`agent-sessions`) is synced between machines via **git**
+(`git@github.com:wizlijun/sotvault.git`); the manifest and every session file are
+committed. This dictates two rules:
+
+- The **per-device manifest files must be committed** so that after `git pull`,
+  device B can read device A's manifest and build the union index.
+- The **device_id file must be git-ignored** so it is never synced. If it were
+  committed, every machine would pull the same id and device-scoping would
+  collapse into a single shared identity — the bug we are fixing.
+
 ## Design
 
 ### 1. Device identity
 
 New helpers (in `export_sessions.py`):
 
-- `device_id() -> str`
-  - Read from a local, **non-synced, non-git** state file:
-    `~/.config/codexclaudeappsessions/device_id`.
-  - If absent: generate `uuid.uuid4()`, create the directory, write the file,
-    return it. First-run generation only.
+- `device_id(out_root) -> str`
+  - Read from `<out_root>/.device_id` (i.e. under `agent-sessions`).
+  - If absent: generate `uuid.uuid4()`, write the file, return it. First-run
+    generation only.
+  - **Load-bearing requirement:** `agent-sessions/.device_id` must be added to
+    the sotvault repo's `.gitignore`, so git-based sync keeps it local per
+    machine. Because sync is git (not live file sync), a git-ignored file stays
+    device-local.
 - `device_name() -> str`
   - `socket.gethostname()`, falling back to `Device-<device_id()[:8]>` on error
     or empty result.
 
-The id file lives outside the shared vault and outside the git repo, so it is
-never synced between machines — each machine keeps its own stable id.
+Caveat: this placement is safe *because* the vault syncs via git + `.gitignore`.
+If the vault were ever moved to a live file-sync mechanism (Dropbox/iCloud),
+`.device_id` would sync and break scoping; such a move would require relocating
+the id file to a non-synced path (e.g. `~/.config/codexclaudeappsessions/`).
 
 ### 2. Manifest layout
 
@@ -77,7 +94,7 @@ Each file keeps the existing shape plus two identity fields:
 
 `MANIFEST_NAME` becomes the directory name `.export_manifest`.
 `manifest_path(out_root)` returns
-`<out_root>/.export_manifest/<device_id()>.json`.
+`<out_root>/.export_manifest/<device_id(out_root)>.json`.
 
 ### 3. Read / write responsibilities
 
@@ -143,10 +160,12 @@ save_manifest ──────────> vault/.export_manifest/<id>.json  
 
 - Missing/corrupt device manifest → treated as empty, skipped in the union read
   (never aborts the run).
-- Cannot create `~/.config/codexclaudeappsessions/` or write the id file → fall
-  back to an in-memory id derived from `device_name()` for this run and warn on
-  stderr (degrades to hostname-scoped rather than crashing).
+- Cannot write `<out_root>/.device_id` → fall back to an in-memory id derived
+  from `device_name()` for this run and warn on stderr (degrades to
+  hostname-scoped rather than crashing).
 - `.export_manifest/` directory creation is `exist_ok=True`.
+- Implementation must also add `agent-sessions/.device_id` to the sotvault
+  repo's `.gitignore` (a change in that repo, not this one).
 
 ## Testing
 
