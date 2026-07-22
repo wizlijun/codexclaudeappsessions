@@ -99,7 +99,24 @@ def build_markdown(title: str, meta_lines: list[str], sections: Sections,
     return "\n".join(lines).rstrip() + "\n"
 
 
+def to_local(value: dt.datetime | None) -> dt.datetime | None:
+    """Convert a datetime to the OS local timezone.
+
+    All supported transcript formats emit UTC timestamps (ISO strings ending
+    in ``Z`` or epoch seconds), so any tz-aware value is converted with
+    ``astimezone()`` and any naive value is assumed to be UTC first. This is
+    the single choke point that guarantees dates written to Markdown and used
+    for month/day bucketing reflect local wall-clock time, not UTC.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=dt.timezone.utc)
+    return value.astimezone()
+
+
 def fmt_dt(value: dt.datetime | None) -> str:
+    value = to_local(value)
     return value.strftime("%Y-%m-%d %H:%M") if value else ""
 
 

@@ -18,6 +18,8 @@ import json
 import re
 import sys
 
+from render_common import fmt_dt
+
 # Content/text we never want to surface as a "user question": these are
 # synthetic turns the harness injects (command stdout, system reminders, etc.).
 _CMD_NAME_RE = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.S)
@@ -196,9 +198,9 @@ def transcript_to_md(jsonl_path: str, title: str, meta_extra: dict | None = None
 
     meta = []
     if parsed["started"]:
-        meta.append(f"- **Started:** {parsed['started'].strftime('%Y-%m-%d %H:%M')}")
+        meta.append(f"- **Started:** {fmt_dt(parsed['started'])}")
     if parsed["ended"]:
-        meta.append(f"- **Ended:** {parsed['ended'].strftime('%Y-%m-%d %H:%M')}")
+        meta.append(f"- **Ended:** {fmt_dt(parsed['ended'])}")
     if parsed["model"]:
         meta.append(f"- **Model:** {parsed['model']}")
     for key, val in (meta_extra or {}).items():

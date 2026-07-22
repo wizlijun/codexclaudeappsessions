@@ -154,7 +154,8 @@ def emit(out_root: str, vendor: str, account: str, source: str | None,
         rel_path = force_path
     else:
         out_dir = os.path.join(out_root, *base_rel.split("/"))
-        prefix = when.strftime("%Y%m%d") if when else "00000000"
+        local_when = rc.to_local(when)
+        prefix = local_when.strftime("%Y%m%d") if local_when else "00000000"
         stem = reserve(out_dir, f"{prefix}-{slugify(title, 'session')}")
         rel_path = f"{base_rel}/{stem}.md"
 
@@ -957,7 +958,12 @@ def manifest_rows(out_root: str, manifest: dict) -> list[dict]:
 # Index + main
 # --------------------------------------------------------------------------- #
 def _month_key(when) -> str:
-    """Bucket key for a session row: 'YYYY-MM', or 'undated' when no timestamp."""
+    """Bucket key for a session row: 'YYYY-MM', or 'undated' when no timestamp.
+
+    Bucketed by local wall-clock month (via to_local) so a session run near
+    midnight lands in the day/month the user actually ran it, not its UTC day.
+    """
+    when = rc.to_local(when)
     return when.strftime("%Y-%m") if when else "undated"
 
 
