@@ -7,8 +7,12 @@ output_dir: /Users/bruce/git/sotvault/agent-sessions
 
 # Optional overrides (uncomment to use):
 #
-# Path to a ChatGPT data-export conversations.json (ChatGPT chats are
-# server-side and cannot be read locally).
+# ChatGPT data export. The macOS app stores conversations locally but ENCRYPTED
+# (~/Library/Application Support/com.openai.chat/conversations-v3-<id>/*.data,
+# no public way to decrypt), so the only supported route is an official export:
+# ChatGPT -> Settings -> Data Controls -> Export Data -> unzip the emailed .zip.
+# Point this at the unzipped folder (preferred) or its conversations.json:
+# chatgpt_export: /Users/bruce/Downloads/chatgpt-export
 # chatgpt_export: /Users/bruce/Downloads/chatgpt-export/conversations.json
 #
 # Account email to attribute Claude Code / Codex sessions to (they do not record

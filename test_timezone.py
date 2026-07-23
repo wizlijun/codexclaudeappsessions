@@ -39,8 +39,9 @@ def test_month_key_uses_local_month():
 
 
 def test_filename_prefix_uses_local_date():
+    # Filenames use a YYYY-MM-DD local-date prefix.
     utc = dt.datetime(2026, 6, 30, 20, 0, tzinfo=dt.timezone.utc)
-    assert rc.to_local(utc).strftime("%Y%m%d") == "20260701"
+    assert rc.to_local(utc).strftime("%Y-%m-%d") == "2026-07-01"
 
 
 if __name__ == "__main__":

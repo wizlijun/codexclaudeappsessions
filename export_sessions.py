@@ -168,7 +168,7 @@ def emit(out_root: str, vendor: str, account: str, source: str | None,
     else:
         out_dir = os.path.join(out_root, *base_rel.split("/"))
         local_when = rc.to_local(when)
-        prefix = local_when.strftime("%Y%m%d") if local_when else "00000000"
+        prefix = local_when.strftime("%Y-%m-%d") if local_when else "0000-00-00"
         start_time = local_when.strftime("%H%M%S") if local_when else None
         stem = reserve(out_dir, f"{prefix}-{slugify(title, 'session')}", start_time)
         rel_path = f"{base_rel}/{stem}.md"
@@ -541,14 +541,33 @@ def codex_tasks(thinking: bool, project: str | None, account_override: str | Non
         yield key, version, "openai", render
 
 
+def _resolve_chatgpt_export(export_path: str) -> str | None:
+    """Accept either conversations.json or the unzipped export folder.
+
+    A ChatGPT data export (Settings -> Data Controls -> Export) arrives as a zip
+    that unpacks to a folder containing conversations.json (+ user.json), so
+    pointing chatgpt_export at that folder should just work.
+    """
+    if os.path.isdir(export_path):
+        cand = os.path.join(export_path, "conversations.json")
+        return cand if os.path.isfile(cand) else None
+    return export_path if os.path.isfile(export_path) else None
+
+
 def chatgpt_tasks(export_path: str | None):
     if not export_path:
-        print("  (chatgpt) no chatgpt_export configured; ChatGPT chats are server-side, "
-              "skipping. Download a data export and set chatgpt_export.", file=sys.stderr)
+        print("  (chatgpt) no chatgpt_export configured; ChatGPT chats are server-side "
+              "and the macOS app stores them encrypted locally, so they cannot be read "
+              "directly. Download a data export (Settings -> Data Controls -> Export) and "
+              "set chatgpt_export to the unzipped folder or its conversations.json.",
+              file=sys.stderr)
         return
-    if not os.path.isfile(export_path):
-        print(f"  (chatgpt) {export_path} not found; skipping", file=sys.stderr)
+    resolved = _resolve_chatgpt_export(export_path)
+    if not resolved:
+        print(f"  (chatgpt) no conversations.json found at {export_path}; skipping",
+              file=sys.stderr)
         return
+    export_path = resolved
     account = _chatgpt_account(export_path)
     for conv in load_chatgpt(export_path):
         key = f"chatgpt:{conv.get('id') or conv.get('conversation_id')}"
@@ -937,7 +956,7 @@ def vendor_source_present(vendor: str, export_dir: str | None = None,
                     os.path.join(export_dir, "conversations.json"))))
     if vendor == "openai":
         return (os.path.isdir(CODEX_SESSIONS)
-                or bool(chatgpt_export and os.path.isfile(chatgpt_export)))
+                or bool(chatgpt_export and _resolve_chatgpt_export(chatgpt_export)))
     if vendor == "droid":
         return os.path.isdir(DROID_SESSIONS)
     if vendor == "openclaw":
