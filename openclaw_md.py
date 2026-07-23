@@ -166,14 +166,14 @@ def openclaw_to_md(path: str, meta_extra: dict | None = None,
 
     meta = []
     if parsed["started"]:
-        meta.append(f"- **Started:** {fmt_dt(parsed['started'])}")
+        meta.append(f"- Started: {fmt_dt(parsed['started'])}")
     if parsed["ended"]:
-        meta.append(f"- **Ended:** {fmt_dt(parsed['ended'])}")
+        meta.append(f"- Ended: {fmt_dt(parsed['ended'])}")
     if parsed["model"]:
-        meta.append(f"- **Model:** {parsed['model']}")
+        meta.append(f"- Model: {parsed['model']}")
     for key, val in (meta_extra or {}).items():
         if val:
-            meta.append(f"- **{key}:** {val}")
+            meta.append(f"- {key}: {val}")
 
     return {
         "markdown": build_markdown(final_title, meta, sections,

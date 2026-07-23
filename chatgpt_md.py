@@ -82,10 +82,10 @@ def conversation_to_md(conv: dict, include_thinking: bool = False) -> dict:
     updated = epoch_to_dt(conv.get("update_time"))
     meta = []
     if created:
-        meta.append(f"- **Created:** {fmt_dt(created)}")
+        meta.append(f"- Created: {fmt_dt(created)}")
     if updated:
-        meta.append(f"- **Updated:** {fmt_dt(updated)}")
-    meta.append("- **Source:** ChatGPT (data export)")
+        meta.append(f"- Updated: {fmt_dt(updated)}")
+    meta.append("- Source: ChatGPT (data export)")
 
     return {
         "markdown": build_markdown(title, meta, sections, assistant_label="ChatGPT"),

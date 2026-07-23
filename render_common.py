@@ -87,7 +87,7 @@ def build_markdown(title: str, meta_lines: list[str], sections: Sections,
     """Assemble the final Markdown document."""
     lines = [f"# {title}", ""]
     lines.extend(meta_lines)
-    lines.append(f"- **User turns:** {sections.user_turns}")
+    lines.append(f"- User turns: {sections.user_turns}")
     lines.extend(["", "---", ""])
     for section in sections.items:
         lines.append("## 👤 User" if section["role"] == "user"

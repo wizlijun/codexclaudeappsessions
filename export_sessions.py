@@ -114,11 +114,24 @@ def account_slug(label: str | None) -> str:
     return re.sub(r"[^\w@.\-]", "_", base) or "unknown-account"
 
 
-def reserve(out_dir: str, base: str) -> str:
+def reserve(out_dir: str, base: str, disambiguator: str | None = None) -> str:
+    """Claim a unique filename stem within `out_dir`.
+
+    The manifest is the primary identity source: a known session overwrites its
+    recorded path (see run_tasks/force_path) and never reaches here. So any
+    collision on `base` is between DIFFERENT sessions sharing a date+title — we
+    keep both. `disambiguator` (the session start time, HHMMSS) makes the second
+    name deterministic from content, so it stays stable even if the manifest is
+    lost. Only if that also collides (or is absent) do we fall back to -2/-3.
+    """
     used = _USED.setdefault(out_dir, set())
-    name, n = base, 2
+    if base not in used:
+        used.add(base)
+        return base
+    stem = f"{base}-{disambiguator}" if disambiguator else base
+    name, n = stem, 2
     while name in used:
-        name = f"{base}-{n}"
+        name = f"{stem}-{n}"
         n += 1
     used.add(name)
     return name
@@ -156,7 +169,8 @@ def emit(out_root: str, vendor: str, account: str, source: str | None,
         out_dir = os.path.join(out_root, *base_rel.split("/"))
         local_when = rc.to_local(when)
         prefix = local_when.strftime("%Y%m%d") if local_when else "00000000"
-        stem = reserve(out_dir, f"{prefix}-{slugify(title, 'session')}")
+        start_time = local_when.strftime("%H%M%S") if local_when else None
+        stem = reserve(out_dir, f"{prefix}-{slugify(title, 'session')}", start_time)
         rel_path = f"{base_rel}/{stem}.md"
 
     write_session(os.path.join(out_root, os.path.dirname(rel_path)),
@@ -364,13 +378,13 @@ def chat_to_md(conv: dict) -> str:
     name = conv.get("name") or "(untitled)"
     lines = [f"# {name}", ""]
     if conv.get("created_at"):
-        lines.append(f"- **Created:** {rc.fmt_dt(rc.parse_iso(conv['created_at']))}")
+        lines.append(f"- Created: {rc.fmt_dt(rc.parse_iso(conv['created_at']))}")
     if conv.get("updated_at"):
-        lines.append(f"- **Updated:** {rc.fmt_dt(rc.parse_iso(conv['updated_at']))}")
+        lines.append(f"- Updated: {rc.fmt_dt(rc.parse_iso(conv['updated_at']))}")
     messages = conv.get("chat_messages") or []
-    lines.append(f"- **Messages:** {len(messages)}")
+    lines.append(f"- Messages: {len(messages)}")
     if conv.get("uuid"):
-        lines.append(f"- **UUID:** `{conv['uuid']}`")
+        lines.append(f"- UUID: `{conv['uuid']}`")
     summary = (conv.get("summary") or "").strip()
     if summary:
         lines.extend(["", f"> {summary}"])

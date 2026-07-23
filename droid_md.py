@@ -93,12 +93,12 @@ def droid_to_md(path: str, meta_extra: dict, include_thinking: bool = False) -> 
 
     meta = []
     if parsed["started"]:
-        meta.append(f"- **Started:** {fmt_dt(parsed['started'])}")
+        meta.append(f"- Started: {fmt_dt(parsed['started'])}")
     if parsed["ended"]:
-        meta.append(f"- **Ended:** {fmt_dt(parsed['ended'])}")
+        meta.append(f"- Ended: {fmt_dt(parsed['ended'])}")
     for key, val in (meta_extra or {}).items():
         if val:
-            meta.append(f"- **{key}:** {val}")
+            meta.append(f"- {key}: {val}")
 
     return {
         "markdown": build_markdown(title, meta, sections, assistant_label="Droid"),
