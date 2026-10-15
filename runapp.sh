@@ -28,7 +28,7 @@ echo "================================================================"
 
 # Run each vendor as its own pass so one failure doesn't block the others.
 status=0
-for vendor in claude openai droid openclaw; do
+for vendor in claude openai droid openclaw cursor grokbot; do
   echo ""
   echo ">>> Exporting vendor: $vendor"
   if "$PY" export_sessions.py --vendor "$vendor" "$@"; then

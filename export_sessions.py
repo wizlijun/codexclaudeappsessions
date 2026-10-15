@@ -8,6 +8,8 @@ Output layout:
       openai/<account>/{chatgpt,codex}/*.md
       droid/<account>/*.md
       openclaw/<account>/{webchat,weixin,wecom,cron,subagent,...}/*.md
+      cursor/<account>/{agent,subagent}/<project>/*.md
+      grokbot/<account>/chat/<bot>/*.md
       index-<device>.md        (per-device landing: totals + month links)
       index-<device>-YYYY-MM.md (one concise line per session that month)
 
@@ -20,11 +22,19 @@ Sources and where they live:
                          server-side; pass one with --chatgpt-export)
   * droid              - ~/.factory/sessions/<proj>/<uuid>.jsonl
   * openclaw           - ~/.openclaw/agents/<agent>/sessions/<uuid>.jsonl
+  * cursor             - ~/.cursor/projects/<slug>/agent-transcripts/<id>/*.jsonl
+                         and the live composer in Cursor's global state.vscdb
+  * grokbot            - ~/Library/Application Support/Grok Bot/sand-client-persistence
+                         (transcript.replicas blobs; rolling window, archived
+                         under <output>/grokbot/.archive). Optional fallback:
+                         grokbot_data → agent-data store.db or a .tgz.
+                         ~/git/grokbot is never read.
 
 Account attribution: chat from users.json; cowork per-session from its metadata;
 claude-code/codex from the current CLI login (no per-session account is
 recorded); droid from the session owner; openclaw from authProfileOverride
-(or agent id).
+(or agent id); cursor from the current Cursor login; grokbot from that same
+login (Grok Bot signs in with Cursor) unless grokbot_account is set.
 
 Usage:
     python export_sessions.py                          # everything found
@@ -40,20 +50,28 @@ import argparse
 import base64
 import datetime as dt
 import glob
+import hashlib
 import json
 import os
 import re
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
+import tarfile
+import tempfile
 import uuid
+from urllib.parse import unquote, urlparse
 
 import render_common as rc
 from chatgpt_md import conversation_to_md as chatgpt_conv_to_md
 from chatgpt_md import load_conversations as load_chatgpt
 from codex_md import codex_to_md
+from cursor_md import (cursor_jsonl_to_md, cursor_to_md, hashes_from_conversation_state,
+                       messages_from_blobs, parse_messages)
 from droid_md import droid_to_md
+import grokbot_md
 from openclaw_md import openclaw_to_md
 from transcript_md import transcript_to_md
 
@@ -67,6 +85,12 @@ CODEX_AUTH = os.path.join(HOME, ".codex", "auth.json")
 DROID_SESSIONS = os.path.join(HOME, ".factory", "sessions")
 OPENCLAW_AGENTS = os.path.join(HOME, ".openclaw", "agents")
 OPENCLAW_CONFIG = os.path.join(HOME, ".openclaw", "openclaw.json")
+CURSOR_PROJECTS = os.path.join(HOME, ".cursor", "projects")
+CURSOR_STATE_DB = os.path.join(
+    HOME, "Library", "Application Support", "Cursor", "User",
+    "globalStorage", "state.vscdb")
+CURSOR_WORKSPACES = os.path.join(
+    HOME, "Library", "Application Support", "Cursor", "User", "workspaceStorage")
 
 # Config file lives next to this script.
 DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yml")
@@ -152,7 +176,8 @@ def emit(out_root: str, vendor: str, account: str, source: str | None,
          git: dict | None = None, force_path: str | None = None) -> dict:
     """Write one session file and return its index row.
 
-    High-volume agent sources (codex, droid, claude-code, openclaw) pass `project`
+    High-volume agent sources (codex, droid, claude-code, openclaw, cursor,
+    grokbot) pass `project`
     to bucket sessions into per-project subfolders, plus `cwd`/`git` so a
     per-project _project.md can describe the repository. `force_path` (relative
     to out_root) overwrites an existing session's file in place during
@@ -290,6 +315,30 @@ def current_claude_email() -> str | None:
             return (json.load(fh).get("oauthAccount") or {}).get("emailAddress")
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def current_cursor_email() -> str | None:
+    """Account email from the Cursor login. Tokens are not read."""
+    if not os.path.isfile(CURSOR_STATE_DB):
+        return None
+    try:
+        con = sqlite3.connect(f"file:{CURSOR_STATE_DB}?mode=ro", uri=True)
+        try:
+            row = con.execute(
+                "SELECT value FROM ItemTable WHERE key = ?",
+                ("cursorAuth/cachedEmail",),
+            ).fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    if not row or not row[0]:
+        return None
+    email = row[0]
+    if isinstance(email, bytes):
+        email = email.decode("utf-8", "replace")
+    email = str(email).strip().strip('"')
+    return email or None
 
 
 def current_codex_email() -> str | None:
@@ -805,6 +854,580 @@ def openclaw_tasks(thinking: bool, project: str | None):
 
 
 # --------------------------------------------------------------------------- #
+# Cursor
+# --------------------------------------------------------------------------- #
+def _file_uri_path(uri: str | None) -> str | None:
+    if not uri or not isinstance(uri, str):
+        return None
+    if uri.startswith("file:"):
+        path = unquote(urlparse(uri).path)
+    else:
+        path = uri
+    return path or None
+
+
+def cursor_project_slug(path: str) -> str:
+    """Cursor's project-folder name: absolute path, leading slash dropped, `/` → `-`."""
+    path = os.path.abspath(path).replace("\\", "/")
+    if len(path) > 1 and path.endswith("/"):
+        path = path[:-1]
+    if path.startswith("/"):
+        path = path[1:]
+    return path.replace("/", "-")
+
+
+def load_cursor_workspaces() -> dict[str, str]:
+    """Map workspaceStorage id and project slug → filesystem path."""
+    by_id: dict[str, str] = {}
+    if not os.path.isdir(CURSOR_WORKSPACES):
+        return by_id
+    for ws_json in glob.glob(os.path.join(CURSOR_WORKSPACES, "*", "workspace.json")):
+        try:
+            with open(ws_json, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        raw = data.get("folder") or data.get("workspace") or data.get("configuration")
+        path = _file_uri_path(raw)
+        if not path:
+            continue
+        by_id[os.path.basename(os.path.dirname(ws_json))] = path
+    return by_id
+
+
+def _resolve_cursor_cwd(slug: str | None, workspace_id: str | None,
+                        by_id: dict[str, str]) -> str | None:
+    if workspace_id and by_id.get(workspace_id):
+        return by_id[workspace_id]
+    if not slug:
+        return None
+    for path in by_id.values():
+        if cursor_project_slug(path) == slug:
+            return path
+    candidate = "/" + slug.replace("-", "/")
+    if os.path.isdir(candidate):
+        return candidate
+    return None
+
+
+def _cursor_project_name(cwd: str | None, slug: str | None) -> str | None:
+    if cwd:
+        if cwd.endswith(".code-workspace"):
+            return os.path.splitext(os.path.basename(cwd))[0]
+        return os.path.basename(cwd.rstrip("/")) or None
+    return slug or None
+
+
+def _load_cursor_db() -> tuple[dict[str, bytes], list[dict]]:
+    """Return (blob-by-hash, composer records) from the global state DB."""
+    blobs: dict[str, bytes] = {}
+    composers: list[dict] = []
+    if not os.path.isfile(CURSOR_STATE_DB):
+        return blobs, composers
+    try:
+        con = sqlite3.connect(f"file:{CURSOR_STATE_DB}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return blobs, composers
+    try:
+        for key, val in con.execute(
+                "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'agentKv:blob:%'"):
+            digest = key.split("agentKv:blob:", 1)[-1]
+            if isinstance(val, str):
+                val = val.encode()
+            if isinstance(val, bytes):
+                blobs[digest] = val
+        headers: dict[str, dict] = {}
+        try:
+            for row in con.execute(
+                    "SELECT composerId, workspaceId, createdAt, lastUpdatedAt, "
+                    "isSubagent, subagentTypeName FROM composerHeaders"):
+                headers[row[0]] = {
+                    "workspaceId": row[1],
+                    "createdAt": row[2],
+                    "lastUpdatedAt": row[3],
+                    "isSubagent": bool(row[4]),
+                    "subagentTypeName": row[5],
+                }
+        except sqlite3.Error:
+            headers = {}
+        for key, val in con.execute(
+                "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'"):
+            cid = key.split("composerData:", 1)[-1]
+            if isinstance(val, bytes):
+                val = val.decode("utf-8", "replace")
+            try:
+                data = json.loads(val)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            state = data.get("conversationState") or ""
+            if not hashes_from_conversation_state(state):
+                continue
+            header = headers.get(cid) or {}
+            model = None
+            model_cfg = data.get("modelConfig")
+            if isinstance(model_cfg, dict):
+                model = model_cfg.get("modelName")
+            composers.append({
+                "id": cid,
+                "name": (data.get("name") or "").strip() or None,
+                "state": state,
+                "model": model,
+                "workspaceId": header.get("workspaceId"),
+                "createdAt": header.get("createdAt") or data.get("createdAt"),
+                "lastUpdatedAt": header.get("lastUpdatedAt"),
+                "isSubagent": bool(header.get("isSubagent")),
+                "subagentTypeName": header.get("subagentTypeName"),
+                "headers": data.get("fullConversationHeadersOnly") or [],
+            })
+    except sqlite3.Error:
+        return {}, []
+    finally:
+        con.close()
+    return blobs, composers
+
+
+def _composer_span(comp: dict):
+    times = []
+    for header in comp.get("headers") or []:
+        if isinstance(header, dict):
+            ts = rc.parse_iso(header.get("createdAt") or "")
+            if ts:
+                times.append(ts)
+    started = min(times) if times else rc.epoch_to_dt(comp.get("createdAt"))
+    ended = max(times) if times else (
+        rc.epoch_to_dt(comp.get("lastUpdatedAt")) or started)
+    return started, ended
+
+
+def _iter_cursor_jsonl():
+    if not os.path.isdir(CURSOR_PROJECTS):
+        return
+    for jsonl in glob.glob(os.path.join(
+            CURSOR_PROJECTS, "*", "agent-transcripts", "**", "*.jsonl"), recursive=True):
+        base = os.path.basename(jsonl)
+        # Session files are <uuid>/<uuid>.jsonl (subagents nest the same way).
+        if os.path.splitext(base)[0] != os.path.basename(os.path.dirname(jsonl)):
+            continue
+        yield jsonl
+
+
+def cursor_tasks(thinking: bool, project: str | None, account_override: str | None):
+    if not os.path.isdir(CURSOR_PROJECTS) and not os.path.isfile(CURSOR_STATE_DB):
+        print("  (cursor) none found; skipping", file=sys.stderr)
+        return
+    account = account_override or current_cursor_email() or "unknown-account"
+    by_id = load_cursor_workspaces()
+    blobs, composers = _load_cursor_db()
+
+    # One manifest key per session id. Prefer the live composer when it is at
+    # least as new as the JSONL archive (the archive is written when a chat ends).
+    # Tuple: kind, payload, activity_epoch, slug, is_sub, version.
+    chosen: dict[str, tuple] = {}
+    marker = f"{os.sep}agent-transcripts{os.sep}"
+    for jsonl in _iter_cursor_jsonl():
+        sid = os.path.splitext(os.path.basename(jsonl))[0]
+        slug = os.path.basename(jsonl.split(marker, 1)[0])
+        is_sub = f"{os.sep}subagents{os.sep}" in jsonl
+        mtime = _mtime(jsonl)
+        chosen[sid] = ("jsonl", jsonl, mtime, slug, is_sub, mtime)
+
+    for comp in composers:
+        sid = comp["id"]
+        _started, ended = _composer_span(comp)
+        db_epoch = ended.timestamp() if ended else 0
+        state_ver = hashlib.sha256((comp.get("state") or "").encode("utf-8")).hexdigest()[:20]
+        prev = chosen.get(sid)
+        if prev is None or db_epoch >= prev[2]:
+            chosen[sid] = ("db", comp, db_epoch, None, comp["isSubagent"], state_ver)
+
+    for sid, spec in chosen.items():
+        kind, payload, _activity, slug, is_sub, version = spec
+        key = f"cursor:{sid}"
+        source = "subagent" if is_sub else "agent"
+
+        def render(kind=kind, payload=payload, slug=slug, source=source, sid=sid):
+            if kind == "jsonl":
+                cwd = _resolve_cursor_cwd(slug, None, by_id)
+            else:
+                cwd = _resolve_cursor_cwd(None, payload.get("workspaceId"), by_id)
+            proj = _cursor_project_name(cwd, slug)
+            haystack = " ".join(p for p in (cwd, proj, slug) if p)
+            if project and project.lower() not in haystack.lower():
+                return None
+            extra = {
+                "Account": f"{account} (current login)",
+                "Source": "Cursor" if source == "agent" else "Cursor subagent",
+                "Project": proj,
+                "Working dir": cwd,
+                "Session": sid,
+            }
+            if kind == "jsonl":
+                result = cursor_jsonl_to_md(payload, meta_extra=extra,
+                                            include_thinking=thinking)
+            else:
+                messages = messages_from_blobs(
+                    hashes_from_conversation_state(payload.get("state")), blobs)
+                parsed = parse_messages(messages, include_thinking=thinking)
+                started, ended = _composer_span(payload)
+                if payload.get("subagentTypeName"):
+                    extra["Subagent"] = payload["subagentTypeName"]
+                result = cursor_to_md(
+                    parsed["sections"], payload.get("name"), extra,
+                    started=started, ended=ended, model=payload.get("model"))
+            if result["user_turns"] == 0:
+                return None
+            return {
+                "account": account,
+                "source": source,
+                "project": proj,
+                "when": result["started"],
+                "title": result["title"],
+                "markdown": result["markdown"],
+                "turns": result["user_turns"],
+                "cwd": cwd,
+                "git": None,
+            }
+        yield key, version, "cursor", render
+
+
+# --------------------------------------------------------------------------- #
+# Grok Bot
+# --------------------------------------------------------------------------- #
+def _resolve_agents_dir(root: str) -> str | None:
+    """Accept an agent-data dir, its agents/ child, or a parent of agent-data."""
+    if not root or not os.path.isdir(root):
+        return None
+    candidates = [
+        os.path.join(root, "agents"),
+        os.path.join(root, "agent-data", "agents"),
+        root,
+    ]
+    for cand in candidates:
+        if not os.path.isdir(cand):
+            continue
+        for child in os.listdir(cand):
+            if os.path.isfile(os.path.join(cand, child, "store.db")):
+                return cand
+    return None
+
+
+# ~/git/grokbot is a local archive and is never a session source.
+GROKBOT_IGNORED_ROOT = os.path.join(HOME, "git", "grokbot")
+
+
+def _grokbot_path_ignored(path: str | None) -> bool:
+    if not path:
+        return False
+    real = os.path.realpath(os.path.expanduser(path))
+    ignored = os.path.realpath(GROKBOT_IGNORED_ROOT)
+    return real == ignored or real.startswith(ignored + os.sep)
+
+
+def _grokbot_search_roots(explicit: str | None) -> list[str]:
+    """store.db fallback roots. Only an explicit grokbot_data path is searched.
+
+    The desktop cache is read separately. ``~/git/grokbot`` is never a root.
+    """
+    if not explicit:
+        return []
+    path = os.path.expanduser(explicit)
+    if _grokbot_path_ignored(path):
+        return []
+    return [path]
+
+
+def _grokbot_persist_dir(config_value: str | None) -> str:
+    return os.path.expanduser(config_value or grokbot_md.DEFAULT_PERSIST_DIR)
+
+
+def grokbot_source_present(explicit: str | None, persist_dir: str | None = None) -> bool:
+    """True when a desktop replica cache or a store.db fallback is readable."""
+    if not _grokbot_path_ignored(persist_dir):
+        directory = _grokbot_persist_dir(persist_dir)
+        if os.path.isdir(directory):
+            try:
+                names = os.listdir(directory)
+            except OSError:
+                names = []
+            for fn in names:
+                key = grokbot_md.decode_blob_name(fn) or ""
+                if ".transcript.replicas." in key:
+                    return True
+    if explicit and not _grokbot_path_ignored(explicit):
+        root = os.path.expanduser(explicit)
+        if os.path.isfile(root) and root.endswith((".tgz", ".tar.gz", ".tar")):
+            return True
+        if _resolve_agents_dir(root):
+            return True
+    return False
+
+
+def _agent_profile(path: str | None) -> dict:
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _load_grokbot_stores(explicit: str | None) -> tuple[list[tuple], str | None]:
+    """Return (stores, tempdir).
+
+    Each store is (agent_id, store_path, profile, version). A .tgz/.tar is
+    unpacked only for ``store.db`` and ``profile.json``. The caller deletes
+    ``tempdir`` after the stores have been rendered.
+    """
+    found: list[tuple] = []
+    tmp: str | None = None
+    for root in _grokbot_search_roots(explicit):
+        if _grokbot_path_ignored(root):
+            continue
+        if os.path.isfile(root) and root.endswith((".tgz", ".tar.gz", ".tar")):
+            tmp = tempfile.mkdtemp(prefix="grokbot-export-")
+            try:
+                tf = tarfile.open(root, "r:*")
+            except (OSError, tarfile.TarError) as exc:
+                print(f"  (grokbot) could not read {root}: {exc}", file=sys.stderr)
+                shutil.rmtree(tmp, ignore_errors=True)
+                tmp = None
+                continue
+            with tf:
+                members = {m.name.replace("\\", "/"): m for m in tf.getmembers() if m.isfile()}
+                for name, member in members.items():
+                    if not name.endswith("/store.db"):
+                        continue
+                    agent_id = os.path.basename(os.path.dirname(name))
+                    if not agent_id or agent_id in (".", ".."):
+                        continue
+                    dest_dir = os.path.join(tmp, agent_id)
+                    os.makedirs(dest_dir, exist_ok=True)
+                    store_dest = os.path.join(dest_dir, "store.db")
+                    src = tf.extractfile(member)
+                    if src is None:
+                        continue
+                    with src, open(store_dest, "wb") as out:
+                        shutil.copyfileobj(src, out)
+                    profile_dest = None
+                    for candidate in (name[: -len("store.db")] + "profile.json",):
+                        pmember = members.get(candidate)
+                        if pmember is None and candidate.startswith("./"):
+                            pmember = members.get(candidate[2:])
+                        if pmember is None:
+                            pmember = members.get("./" + candidate)
+                        if pmember is None:
+                            continue
+                        profile_dest = os.path.join(dest_dir, "profile.json")
+                        psrc = tf.extractfile(pmember)
+                        if psrc is not None:
+                            with psrc, open(profile_dest, "wb") as out:
+                                shutil.copyfileobj(psrc, out)
+                        break
+                    found.append((agent_id, store_dest, _agent_profile(profile_dest),
+                                  member.mtime or _mtime(store_dest)))
+            return found, tmp
+        agents = _resolve_agents_dir(root)
+        if not agents:
+            continue
+        for child in sorted(os.listdir(agents)):
+            store = os.path.join(agents, child, "store.db")
+            if not os.path.isfile(store):
+                continue
+            profile = _agent_profile(os.path.join(agents, child, "profile.json"))
+            found.append((child, store, profile, _mtime(store)))
+        return found, None
+    return found, tmp
+
+
+def _grokbot_project_name(name: str, agent_id: str, counts: dict[str, int]) -> str:
+    """Disambiguate bots that share a roster name (two 'New Bot's)."""
+    if counts.get(name, 0) > 1 and name != agent_id:
+        return f"{name}-{agent_id[:8]}"
+    return name
+
+
+def grokbot_tasks(thinking: bool, project: str | None,
+                  data_path: str | None, account_override: str | None,
+                  persist_dir: str | None = None, out_root: str | None = None,
+                  include_agent_mail: bool = True, verbose: bool = False):
+    """Yield one task per bot from the desktop cache, then store.db fallback.
+
+    Replica entries are merged into ``<out_root>/grokbot/.archive/<id>.jsonl``
+    before render, so a later run still has lines that rolled out of the
+    ~200-entry desktop window. ``~/git/grokbot`` is never opened.
+    """
+    if data_path and _grokbot_path_ignored(data_path):
+        print(f"  (grokbot) ignoring {os.path.expanduser(data_path)}", file=sys.stderr)
+        data_path = None
+    persist = _grokbot_persist_dir(persist_dir)
+    if _grokbot_path_ignored(persist):
+        print(f"  (grokbot) ignoring {persist}", file=sys.stderr)
+        persist = ""
+
+    replicas = list(grokbot_md.iter_replicas(persist)) if persist else []
+    readable = {rep["agent_id"] for rep in replicas}
+    roster = grokbot_md.load_roster(persist) if persist else {}
+
+    store_rows: dict[str, tuple] = {}
+    tmp = None
+    if data_path:
+        found, tmp = _load_grokbot_stores(data_path)
+        try:
+            for agent_id, store, profile, mtime in found:
+                store_rows[agent_id] = (
+                    grokbot_md.load_store_entries(store), profile, mtime)
+        finally:
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+                tmp = None
+
+    if not replicas and not store_rows and not (
+            persist and os.path.isdir(persist)):
+        print("  (grokbot) no sand-client-persistence replicas found", file=sys.stderr)
+    elif persist and os.path.isdir(persist) and not replicas and not store_rows:
+        print("  (grokbot) persistence dir has no transcript replicas", file=sys.stderr)
+
+    account_ids = {rep["account_id"] for rep in replicas}
+    multi_account = len(account_ids) > 1 and not account_override
+    if multi_account:
+        grokbot_md.warn(
+            "(grokbot) more than one account in the desktop cache; "
+            "using each account id because grokbot_account is unset")
+    default_account = account_override or current_cursor_email() or "grokbot"
+
+    # Names across replica + store-only bots, for duplicate disambiguation.
+    labels: list[tuple[str, str]] = []
+    for rep in replicas:
+        row = roster.get(rep["account_id"], {}).get(rep["agent_id"], {})
+        profile = (store_rows.get(rep["agent_id"]) or (None, {}, None))[1]
+        bot = (row.get("name") or (profile or {}).get("name") or "").strip() or rep["agent_id"]
+        labels.append((rep["agent_id"], bot))
+    for agent_id, (entries, profile, _mtime_store) in store_rows.items():
+        if agent_id in readable:
+            continue
+        if not entries:
+            continue
+        bot = ((profile or {}).get("name") or "").strip() or agent_id
+        labels.append((agent_id, bot))
+    name_counts: dict[str, int] = {}
+    for _aid, bot in labels:
+        name_counts[bot] = name_counts.get(bot, 0) + 1
+
+    def account_for(account_id: str | None) -> str:
+        if multi_account and account_id:
+            return account_id
+        return default_account
+
+    def emit_bot(agent_id: str, bot: str, account_id: str | None, row: dict,
+                 windows: list[list[dict]], source_label: str, version_bits: list):
+        if project and project.lower() not in f"{bot} {agent_id}".lower():
+            # Still archive, so the window is not lost, but do not emit a task
+            # (a --project run does not prune).
+            if out_root:
+                archive = grokbot_md.archive_path(out_root, agent_id)
+                merged: list[dict] = []
+                for window in windows:
+                    merged = grokbot_md.merge_into_archive(archive, window)
+            return
+        merged: list[dict] = []
+        flat = [entry for window in windows for entry in window]
+        if out_root:
+            archive = grokbot_md.archive_path(out_root, agent_id)
+            for window in windows:
+                merged = grokbot_md.merge_into_archive(archive, window)
+            version = max([0.0, *version_bits, _mtime(archive)])
+        else:
+            for window in windows:
+                merged = grokbot_md.merge_into_archive("", window)
+            version = max([0.0, *version_bits])
+        render_entries = grokbot_md.entries_for_render(merged, flat)
+        seqs = [e.get("seq") for e in merged if isinstance(e.get("seq"), int)]
+        first_seq = min(seqs) if seqs else None
+        truncated = first_seq if first_seq and first_seq > 1 else None
+        proj = _grokbot_project_name(bot, agent_id, name_counts)
+        key = f"grokbot:{agent_id}"
+        account = account_for(account_id)
+
+        def render(render_entries=render_entries, bot=bot, agent_id=agent_id,
+                   row=row, account=account, proj=proj, source_label=source_label,
+                   truncated=truncated):
+            extra = {
+                "Account": account,
+                "Source": source_label,
+                "Agent": bot,
+                "Session": agent_id,
+            }
+            if row.get("isHiddenFromSidebar"):
+                extra["Hidden"] = "yes"
+            result = grokbot_md.grokbot_entries_to_md(
+                render_entries, meta_extra=extra, include_thinking=thinking,
+                truncated_before_seq=truncated,
+                include_agent_mail=include_agent_mail, verbose=verbose)
+            if result["user_turns"] == 0:
+                return None
+            when = result["started"] or rc.epoch_to_dt(row.get("createdAt"))
+            return {
+                "account": account,
+                "source": "chat",
+                "project": proj,
+                "when": when,
+                "title": result["title"],
+                "markdown": result["markdown"],
+                "turns": result["user_turns"],
+                "cwd": None,
+                "git": None,
+            }
+        yield key, version, "grokbot", render
+
+    yielded: set[str] = set()
+    for rep in replicas:
+        agent_id = rep["agent_id"]
+        row = roster.get(rep["account_id"], {}).get(agent_id, {})
+        profile = (store_rows.get(agent_id) or (None, {}, None))[1]
+        bot = (row.get("name") or (profile or {}).get("name") or "").strip() or agent_id
+        windows = [rep["entries"]]
+        bits = [rep["mtime"] or 0.0]
+        store = store_rows.get(agent_id)
+        if store and store[0]:
+            windows.append(store[0])
+            bits.append(store[2] or 0.0)
+        yield from emit_bot(
+            agent_id, bot, rep["account_id"], row, windows,
+            "Grok Bot (desktop cache)", bits)
+        yielded.add(agent_id)
+
+    if persist and os.path.isdir(persist):
+        for agent_id, _account_id, _path in grokbot_md.iter_replica_refs(persist):
+            if agent_id in readable or agent_id in yielded:
+                continue
+            # Unreadable this run: keep the manifest row by being "seen".
+            key = f"grokbot:{agent_id}"
+
+            def render():
+                return None
+            yield key, "unreadable", "grokbot", render
+            yielded.add(agent_id)
+
+    for agent_id, (entries, profile, mtime) in store_rows.items():
+        if agent_id in yielded and not entries:
+            continue
+        if agent_id in yielded:
+            continue  # already merged above
+        if not entries:
+            continue
+        bot = ((profile or {}).get("name") or "").strip() or agent_id
+        yield from emit_bot(
+            agent_id, bot, None, {}, [entries],
+            "Grok Bot (store.db)", [mtime or 0.0])
+
+
+# --------------------------------------------------------------------------- #
 # Incremental export (manifest-driven)
 # --------------------------------------------------------------------------- #
 MANIFEST_NAME = ".export_manifest.json"
@@ -941,7 +1564,9 @@ def run_tasks(out_root: str, manifest: dict, tasks, seen: set,
 
 
 def vendor_source_present(vendor: str, export_dir: str | None = None,
-                          chatgpt_export: str | None = None) -> bool:
+                          chatgpt_export: str | None = None,
+                          grokbot_data: str | None = None,
+                          grokbot_persist: str | None = None) -> bool:
     """Whether the vendor's source exists on this machine.
 
     Used to gate pruning: a source that is *entirely absent* (the tool runs on a
@@ -961,6 +1586,10 @@ def vendor_source_present(vendor: str, export_dir: str | None = None,
         return os.path.isdir(DROID_SESSIONS)
     if vendor == "openclaw":
         return os.path.isdir(OPENCLAW_AGENTS)
+    if vendor == "cursor":
+        return os.path.isdir(CURSOR_PROJECTS) or os.path.isfile(CURSOR_STATE_DB)
+    if vendor == "grokbot":
+        return grokbot_source_present(grokbot_data, grokbot_persist)
     return True
 
 
@@ -1092,7 +1721,9 @@ def write_index(out_root: str, rows: list[dict]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--vendor", choices=["all", "claude", "openai", "droid", "openclaw"],
+    parser.add_argument("--vendor",
+                        choices=["all", "claude", "openai", "droid", "openclaw",
+                                 "cursor", "grokbot"],
                         default="all", help="Which vendor to export (default: all)")
     parser.add_argument("-o", "--output", default=None,
                         help="Output directory (overrides config.yml output_dir)")
@@ -1102,6 +1733,14 @@ def main() -> int:
                         help="Claude chat export directory (conversations.json)")
     parser.add_argument("--chatgpt-export", default=None,
                         help="Path to a ChatGPT data-export conversations.json")
+    parser.add_argument("--grokbot-data", default=None,
+                        help="Grok Bot agent-data directory, or a .tgz that contains "
+                             "agent-data/agents/<id>/store.db")
+    parser.add_argument("--grokbot-persist-dir", default=None,
+                        help="Grok Bot sand-client-persistence directory "
+                             "(default: ~/Library/Application Support/Grok Bot/sand-client-persistence)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print skipped unknown Grok Bot entry kinds")
     parser.add_argument("--project", default=None,
                         help="Only export agent sessions whose working dir matches this substring")
     parser.add_argument("--code-account", default=None,
@@ -1117,6 +1756,13 @@ def main() -> int:
     export_dir = args.export_dir or config.get("export_dir")
     chatgpt_export = args.chatgpt_export or config.get("chatgpt_export")
     code_account = args.code_account or config.get("code_account")
+    cursor_account = config.get("cursor_account")
+    grokbot_account = config.get("grokbot_account")
+    grokbot_data = args.grokbot_data or config.get("grokbot_data")
+    grokbot_persist = args.grokbot_persist_dir or config.get("grokbot_persist_dir")
+    include_agent_mail = config.get("grokbot_include_agent_mail", True)
+    if include_agent_mail is None:
+        include_agent_mail = True
     thinking = args.thinking or bool(config.get("thinking"))
 
     print(f"Output root: {output}")
@@ -1149,6 +1795,19 @@ def main() -> int:
         print("Exporting openclaw…")
         processed_vendors.add("openclaw")
         run_tasks(output, manifest, openclaw_tasks(thinking, args.project), seen, counters)
+    if args.vendor in ("all", "cursor"):
+        print("Exporting cursor…")
+        processed_vendors.add("cursor")
+        run_tasks(output, manifest, cursor_tasks(thinking, args.project, cursor_account), seen, counters)
+    if args.vendor in ("all", "grokbot"):
+        print("Exporting grokbot…")
+        processed_vendors.add("grokbot")
+        run_tasks(output, manifest,
+                  grokbot_tasks(thinking, args.project, grokbot_data, grokbot_account,
+                                persist_dir=grokbot_persist, out_root=output,
+                                include_agent_mail=bool(include_agent_mail),
+                                verbose=args.verbose),
+                  seen, counters)
 
     # Prune sessions whose source disappeared. Pruning is scoped to the vendors
     # processed this run, and skipped entirely under a --project filter (which
@@ -1156,7 +1815,8 @@ def main() -> int:
     removed = 0
     if args.project is None:
         prunable = {v for v in processed_vendors
-                    if vendor_source_present(v, export_dir, chatgpt_export)}
+                    if vendor_source_present(v, export_dir, chatgpt_export, grokbot_data,
+                                             grokbot_persist)}
         for v in sorted(processed_vendors - prunable):
             print(f"  (prune) {v} source absent on this machine; "
                   f"keeping existing sessions", file=sys.stderr)

@@ -24,3 +24,18 @@ output_dir: /Users/bruce/git/sotvault/agent-sessions
 #
 # Include assistant thinking / reasoning blocks (collapsed) in the output.
 # thinking: false
+#
+# Cursor sessions use the current Cursor login (cursorAuth/cachedEmail).
+# cursor_account: bruce@runningbruce.com
+#
+# Grok Bot desktop cache (transcript.replicas blobs). Default is below; set
+# this only to point somewhere else. The cache is a rolling window; exports
+# accumulate under <output_dir>/grokbot/.archive.
+# grokbot_persist_dir: ~/Library/Application Support/Grok Bot/sand-client-persistence
+# Fallback: store.db inside an agent-data directory or a .tgz.
+# ~/git/grokbot is never read.
+# grokbot_data: /path/to/agent-data
+# Account defaults to the current Cursor login.
+# grokbot_account: bruce@runningbruce.com
+# Render messages between bots (fromAgent / toAgent). Default true.
+# grokbot_include_agent_mail: true

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Shared helpers for rendering sessions to Markdown across vendors.
 
-All exporters (Claude chat, Claude Code/Cowork, Codex, Droid, ChatGPT) produce
-the same visual Markdown: a metadata block, then alternating "👤 User" /
+All exporters (Claude chat, Claude Code/Cowork, Codex, Droid, ChatGPT, Cursor,
+Grok Bot) produce the same visual Markdown: a metadata block, then alternating
+"👤 User" /
 "🤖 Claude" sections, with tool calls noted inline. These helpers keep that
 output identical regardless of the source format.
 """
